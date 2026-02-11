@@ -12,7 +12,12 @@ Your AI Tool ──> NadirClaw (:8000/v1) ──> simple prompts  ──> Ollama
 ## Quick Start
 
 ```bash
-pip install -e .
+curl -fsSL https://raw.githubusercontent.com/doramirdor/NadirClaw/main/install.sh | sh
+```
+
+Then start the router:
+
+```bash
 nadirclaw serve --verbose
 ```
 
@@ -21,6 +26,7 @@ That's it. NadirClaw starts on `http://localhost:8000` with sensible defaults (C
 ## Prerequisites
 
 - **Python 3.10+**
+- **git**
 - **At least one LLM provider:**
   - [Ollama](https://ollama.com) running locally (free, no API key needed)
   - [Anthropic API key](https://console.anthropic.com/) for Claude models
@@ -29,12 +35,29 @@ That's it. NadirClaw starts on `http://localhost:8000` with sensible defaults (C
 
 ## Install
 
+### One-line install (recommended)
+
 ```bash
-git clone https://github.com/YOUR_ORG/NadirClaw.git
+curl -fsSL https://raw.githubusercontent.com/doramirdor/NadirClaw/main/install.sh | sh
+```
+
+This clones the repo to `~/.nadirclaw`, creates a virtual environment, installs dependencies, and adds `nadirclaw` to your PATH. Run it again to update.
+
+### Manual install
+
+```bash
+git clone https://github.com/doramirdor/NadirClaw.git
 cd NadirClaw
-python -m venv venv
+python3 -m venv venv
 source venv/bin/activate
 pip install -e .
+```
+
+### Uninstall
+
+```bash
+rm -rf ~/.nadirclaw
+sudo rm -f /usr/local/bin/nadirclaw
 ```
 
 ## Configure
