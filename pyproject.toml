@@ -8,7 +8,19 @@ dynamic = ["version"]
 description = "Open-source LLM router — simple prompts to free models, complex to premium"
 readme = "README.md"
 requires-python = ">=3.10"
-license = {text = "MIT"}
+license = "MIT"
+authors = [{name = "Nadir", email = "nadir@nadirclaw.com"}]
+keywords = ["llm", "router", "ai", "openai", "gemini", "anthropic", "cost-optimization", "model-routing"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
 dependencies = [
     "fastapi>=0.100.0",
     "uvicorn>=0.20.0",
@@ -20,6 +32,11 @@ dependencies = [
     "google-genai>=1.0.0",
     "sse-starlette>=1.0.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/doramirdor/NadirClaw"
+Repository = "https://github.com/doramirdor/NadirClaw"
+Issues = "https://github.com/doramirdor/NadirClaw/issues"
 
 [project.scripts]
 nadirclaw = "nadirclaw.cli:main"
