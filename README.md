@@ -1,5 +1,5 @@
 # NadirClaw
-<img width="1536" height="1024" alt="Image" src="https://github.com/user-attachments/assets/80a5d910-fa91-4a36-80ad-6a59e2d8a14a" />
+<img alt="NadirClaw" src="logo_rb.png" />
 
 
 Open-source LLM router that saves you money. Simple prompts go to cheap/local models, complex prompts go to premium models -- automatically.
