@@ -30,13 +30,19 @@ Or install from source:
 curl -fsSL https://raw.githubusercontent.com/doramirdor/NadirClaw/main/install.sh | sh
 ```
 
-Then start the router:
+Then run the interactive setup wizard:
+
+```bash
+nadirclaw setup
+```
+
+This guides you through selecting providers, entering API keys, and choosing models for each routing tier. Then start the router:
 
 ```bash
 nadirclaw serve --verbose
 ```
 
-That's it. NadirClaw starts on `http://localhost:8856` with sensible defaults (Gemini 3 Flash for simple, OpenAI Codex for complex).
+That's it. NadirClaw starts on `http://localhost:8856` with sensible defaults (Gemini 3 Flash for simple, OpenAI Codex for complex). If you skip `nadirclaw setup`, the `serve` command will offer to run it on first launch.
 
 ## Features
 
@@ -461,6 +467,7 @@ If the estimated token count of a request exceeds a model's context window, Nadi
 ## CLI Reference
 
 ```bash
+nadirclaw setup              # Interactive setup wizard (providers, keys, models)
 nadirclaw serve              # Start the router server
 nadirclaw serve --log-raw    # Start with full request/response logging
 nadirclaw classify           # Classify a prompt (no server needed)
@@ -674,7 +681,8 @@ If the telemetry packages are not installed or `OTEL_EXPORTER_OTLP_ENDPOINT` is 
 ```
 nadirclaw/
   __init__.py        # Package version
-  cli.py             # CLI commands (serve, classify, report, status, auth, codex, openclaw)
+  cli.py             # CLI commands (setup, serve, classify, report, status, auth, codex, openclaw)
+  setup.py           # Interactive setup wizard (provider selection, credentials, model config)
   server.py          # FastAPI server with OpenAI-compatible API + streaming
   classifier.py      # Binary complexity classifier (sentence embeddings)
   credentials.py     # Credential storage, resolution chain, and OAuth token refresh

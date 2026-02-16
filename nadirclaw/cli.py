@@ -17,6 +17,19 @@ def main():
 
 
 @main.command()
+@click.option("--reconfigure", is_flag=True, help="Re-run setup even if configured")
+def setup(reconfigure):
+    """Interactive setup wizard — configure providers and models."""
+    from nadirclaw.setup import is_first_run, run_setup_wizard
+
+    if not reconfigure and not is_first_run():
+        if not click.confirm("Already configured. Re-run setup?", default=False):
+            return
+        reconfigure = True
+    run_setup_wizard(reconfigure=reconfigure)
+
+
+@main.command()
 @click.option("--port", default=None, type=int, help="Port to listen on (default: 8856)")
 @click.option("--simple-model", default=None, help="Model for simple prompts")
 @click.option("--complex-model", default=None, help="Model for complex prompts")
@@ -27,6 +40,15 @@ def main():
 def serve(port, simple_model, complex_model, models, token, verbose, log_raw):
     """Start the NadirClaw router server."""
     import logging
+
+    from nadirclaw.setup import is_first_run
+
+    if is_first_run():
+        if click.confirm("No configuration found. Run setup wizard?", default=True):
+            from nadirclaw.setup import run_setup_wizard
+            run_setup_wizard()
+        else:
+            click.echo("Starting with defaults. Run 'nadirclaw setup' anytime.")
 
     from dotenv import load_dotenv
 
