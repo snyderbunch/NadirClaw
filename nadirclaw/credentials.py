@@ -73,26 +73,37 @@ def _write_credentials(data: dict) -> None:
     path = _credentials_path()
     path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Atomic write: write to temp file then rename to prevent partial writes
-    # on concurrent access or crashes.
-    fd, tmp_path = tempfile.mkstemp(
-        dir=str(path.parent), suffix=".tmp", prefix=".creds-"
-    )
+    # Advisory file lock prevents concurrent `nadirclaw auth` commands from
+    # clobbering each other's writes.
+    lock_path = path.parent / ".credentials.lock"
+    lock_fd = None
     try:
-        with os.fdopen(fd, "w") as f:
-            f.write(json.dumps(data, indent=2) + "\n")
-        os.replace(tmp_path, str(path))
-    except Exception:
-        # Clean up temp file on failure
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+        if platform.system() != "Windows":
+            import fcntl
+            lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
 
-    # Restrict permissions to owner only (Unix)
-    if platform.system() != "Windows":
-        path.chmod(0o600)
+        # Atomic write: write to temp file then rename to prevent partial writes.
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent), suffix=".tmp", prefix=".creds-"
+        )
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps(data, indent=2) + "\n")
+            os.replace(tmp_path, str(path))
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
+        # Restrict permissions to owner only (Unix)
+        if platform.system() != "Windows":
+            path.chmod(0o600)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
 
 
 def save_credential(provider: str, token: str, source: str = "manual") -> None:

@@ -40,6 +40,43 @@ class RateLimitExhausted(Exception):
 
 
 # ---------------------------------------------------------------------------
+# Request rate limiter (in-memory, per user)
+# ---------------------------------------------------------------------------
+
+import collections
+
+_MAX_CONTENT_LENGTH = 1_000_000  # 1 MB total across all messages
+
+
+class _RateLimiter:
+    """Sliding-window rate limiter keyed by user ID."""
+
+    def __init__(self, max_requests: int = 120, window_seconds: int = 60):
+        self._max = max_requests
+        self._window = window_seconds
+        self._hits: Dict[str, collections.deque] = {}
+
+    def check(self, key: str) -> Optional[int]:
+        """Return seconds until retry if rate-limited, else None."""
+        now = time.time()
+        q = self._hits.setdefault(key, collections.deque())
+
+        # Evict timestamps outside the window
+        while q and q[0] <= now - self._window:
+            q.popleft()
+
+        if len(q) >= self._max:
+            retry_after = int(q[0] + self._window - now) + 1
+            return retry_after
+
+        q.append(now)
+        return None
+
+
+_rate_limiter = _RateLimiter()
+
+
+# ---------------------------------------------------------------------------
 # App
 # ---------------------------------------------------------------------------
 
@@ -359,19 +396,26 @@ def _strip_gemini_prefix(model: str) -> str:
     return model.removeprefix("gemini/")
 
 
-# Shared Gemini client — reused across requests to avoid per-request overhead
-_gemini_client = None
-_gemini_client_key = None
+# Shared Gemini clients — reused across requests, keyed by API key.
+# A lock ensures concurrent requests with different keys don't race.
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
+
+_gemini_clients: Dict[str, Any] = {}
+_gemini_client_lock = Lock()
+
+# Bounded thread pool for Gemini calls. Caps the number of concurrent
+# (and leaked-on-timeout) threads so they can't grow unbounded.
+_gemini_executor = ThreadPoolExecutor(max_workers=8, thread_name_prefix="gemini")
 
 
 def _get_gemini_client(api_key: str):
-    """Get or create a shared google-genai Client."""
-    global _gemini_client, _gemini_client_key
-    if _gemini_client is None or _gemini_client_key != api_key:
-        from google import genai
-        _gemini_client = genai.Client(api_key=api_key)
-        _gemini_client_key = api_key
-    return _gemini_client
+    """Get or create a thread-safe, per-key google-genai Client."""
+    with _gemini_client_lock:
+        if api_key not in _gemini_clients:
+            from google import genai
+            _gemini_clients[api_key] = genai.Client(api_key=api_key)
+        return _gemini_clients[api_key]
 
 
 async def _call_gemini(
@@ -428,13 +472,9 @@ async def _call_gemini(
     if request.top_p is not None:
         gen_config_kwargs["top_p"] = request.top_p
 
-    # Prepend a text-only instruction to prevent Gemini from interpreting
-    # tool descriptions in the system prompt as function call declarations.
-    if system_parts:
-        system_parts.append(
-            "\nIMPORTANT: You must respond with plain text only. "
-            "Do NOT attempt to call any functions or tools."
-        )
+    # NOTE: Function call parts are filtered out programmatically when
+    # extracting the response (see "handle function_call parts" below),
+    # so no prompt-level instruction is needed here.
 
     generate_kwargs: Dict[str, Any] = {
         "model": native_model,
@@ -452,11 +492,14 @@ async def _call_gemini(
 
     logger.debug("Calling Gemini: model=%s (attempt %d/%d)", native_model, _retry_count + 1, MAX_RETRIES + 1)
 
-    # The google-genai SDK is synchronous; run in a thread to avoid blocking.
+    # The google-genai SDK is synchronous; run in a bounded thread pool
+    # so timed-out threads don't accumulate unboundedly.
+    loop = asyncio.get_running_loop()
     try:
         response = await asyncio.wait_for(
-            asyncio.to_thread(
-                client.models.generate_content, **generate_kwargs
+            loop.run_in_executor(
+                _gemini_executor,
+                lambda: client.models.generate_content(**generate_kwargs),
             ),
             timeout=120,  # 2 minute hard timeout
         )
@@ -716,6 +759,24 @@ async def chat_completions(
     request: ChatCompletionRequest,
     current_user: UserSession = Depends(validate_local_auth),
 ):
+    # --- Rate limiting (per user) ---
+    retry_after = _rate_limiter.check(current_user.id)
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Rate limit exceeded. Retry after {retry_after}s.",
+            headers={"Retry-After": str(retry_after)},
+        )
+
+    # --- Input size validation ---
+    total_content_len = sum(len(m.text_content()) for m in request.messages)
+    if total_content_len > _MAX_CONTENT_LENGTH:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Request content too large ({total_content_len:,} chars). "
+                   f"Maximum is {_MAX_CONTENT_LENGTH:,} chars.",
+        )
+
     start_time = time.time()
     request_id = str(uuid.uuid4())
 
@@ -928,6 +989,8 @@ async def chat_completions(
             },
         }
 
+    except HTTPException:
+        raise  # Re-raise FastAPI HTTP exceptions as-is
     except Exception as e:
         elapsed_ms = int((time.time() - start_time) * 1000)
         logger.error("Completion error: %s", e, exc_info=True)
@@ -938,7 +1001,10 @@ async def chat_completions(
             "error": str(e),
             "total_latency_ms": elapsed_ms,
         })
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(
+            status_code=500,
+            detail=f"An internal error occurred. Request ID: {request_id}",
+        )
 
 
 def _build_streaming_response(

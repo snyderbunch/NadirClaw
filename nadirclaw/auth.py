@@ -75,12 +75,21 @@ async def validate_local_auth(
       - Authorization: Bearer <token>
       - X-API-Key: <token>
     """
+    _MAX_TOKEN_LENGTH = 1000
+
     token: Optional[str] = None
 
     if authorization:
         token = authorization.removeprefix("Bearer ").strip()
     elif x_api_key:
         token = x_api_key.strip()
+
+    # Reject tokens that are unreasonably long (prevent memory abuse)
+    if token and len(token) > _MAX_TOKEN_LENGTH:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid token format",
+        )
 
     # If no auth token is configured, allow all requests (local-only mode)
     configured_token = settings.AUTH_TOKEN

@@ -296,12 +296,16 @@ class SessionCache:
     """Cache routing decisions for multi-turn conversations.
 
     Keyed by a hash of the system prompt + first user message.
-    TTL-based expiry.
+    TTL-based expiry with LRU eviction to cap memory usage.
     """
 
-    def __init__(self, ttl_seconds: int = 1800):
+    def __init__(self, ttl_seconds: int = 1800, max_size: int = 10_000):
         self._cache: Dict[str, Tuple[str, str, float]] = {}  # key → (model, tier, timestamp)
         self._ttl = ttl_seconds
+        self._max_size = max_size
+        self._access_order: List[str] = []  # LRU tracking (most recent at end)
+        self._cleanup_counter = 0
+        self._cleanup_interval = 100  # run cleanup every N puts
 
     def _make_key(self, messages: List[Any]) -> str:
         """Generate a session key from conversation shape."""
@@ -324,6 +328,20 @@ class SessionCache:
         raw = "|".join(parts)
         return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
+    def _touch(self, key: str) -> None:
+        """Move key to end of access order (most recently used)."""
+        try:
+            self._access_order.remove(key)
+        except ValueError:
+            pass
+        self._access_order.append(key)
+
+    def _evict_lru(self) -> None:
+        """Evict least-recently-used entries until under max size."""
+        while len(self._cache) > self._max_size and self._access_order:
+            oldest_key = self._access_order.pop(0)
+            self._cache.pop(oldest_key, None)
+
     def get(self, messages: List[Any]) -> Optional[Tuple[str, str]]:
         """Return (model, tier) if a session exists and isn't expired."""
         key = self._make_key(messages)
@@ -333,13 +351,29 @@ class SessionCache:
         model, tier, ts = entry
         if time.time() - ts > self._ttl:
             del self._cache[key]
+            try:
+                self._access_order.remove(key)
+            except ValueError:
+                pass
             return None
+        self._touch(key)
         return model, tier
 
     def put(self, messages: List[Any], model: str, tier: str) -> None:
         """Store a routing decision for this session."""
+        # Periodic cleanup of expired entries
+        self._cleanup_counter += 1
+        if self._cleanup_counter >= self._cleanup_interval:
+            self._cleanup_counter = 0
+            self.clear_expired()
+
         key = self._make_key(messages)
         self._cache[key] = (model, tier, time.time())
+        self._touch(key)
+
+        # Evict if over capacity
+        if len(self._cache) > self._max_size:
+            self._evict_lru()
 
     def clear_expired(self) -> int:
         """Remove expired entries. Returns number removed."""
@@ -347,6 +381,10 @@ class SessionCache:
         expired = [k for k, (_, _, ts) in self._cache.items() if now - ts > self._ttl]
         for k in expired:
             del self._cache[k]
+            try:
+                self._access_order.remove(k)
+            except ValueError:
+                pass
         return len(expired)
 
 

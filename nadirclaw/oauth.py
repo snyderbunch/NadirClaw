@@ -65,11 +65,18 @@ _GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v1/userinfo?alt=json"
 # client IDs as public identifiers. The actual security is in the per-user
 # access/refresh tokens obtained during the OAuth flow. This is the same pattern
 # used by gcloud CLI, Gemini CLI, and other Google desktop tools.
-_ANTIGRAVITY_CLIENT_ID = _b64decode(
-    "MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ=="
+# Override via env vars: NADIRCLAW_ANTIGRAVITY_CLIENT_ID / NADIRCLAW_ANTIGRAVITY_CLIENT_SECRET
+_ANTIGRAVITY_CLIENT_ID = (
+    os.getenv("NADIRCLAW_ANTIGRAVITY_CLIENT_ID")
+    or _b64decode(
+        "MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ=="
+    )
 )
-_ANTIGRAVITY_CLIENT_SECRET = _b64decode(
-    "R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY="
+_ANTIGRAVITY_CLIENT_SECRET = (
+    os.getenv("NADIRCLAW_ANTIGRAVITY_CLIENT_SECRET")
+    or _b64decode(
+        "R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY="
+    )
 )
 _ANTIGRAVITY_CALLBACK_PORT = 51121
 _ANTIGRAVITY_CALLBACK_PATH = "/oauth-callback"
