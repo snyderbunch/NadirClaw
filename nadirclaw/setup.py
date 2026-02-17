@@ -4,13 +4,14 @@ Guides users through provider selection, credential entry, and model
 configuration on first run or via `nadirclaw setup`.
 """
 
+import json
 import os
 import shutil
 import urllib.error
 import urllib.request
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import click
 
@@ -23,7 +24,7 @@ from nadirclaw.routing import MODEL_REGISTRY
 PROVIDER_INFO: Dict[str, Dict] = {
     "openai": {
         "display": "OpenAI",
-        "description": "GPT-4o, o3, Codex",
+        "description": "GPT-4.1, GPT-5, o3, o4-mini",
         "env_var": "OPENAI_API_KEY",
         "key_prefix": "sk-",
         "oauth": True,
@@ -31,7 +32,7 @@ PROVIDER_INFO: Dict[str, Dict] = {
     },
     "anthropic": {
         "display": "Anthropic",
-        "description": "Claude Sonnet, Opus, Haiku",
+        "description": "Claude Opus 4.6, Sonnet 4.5, Haiku 4.5",
         "env_var": "ANTHROPIC_API_KEY",
         "key_prefix": "sk-ant-",
         "oauth": True,
@@ -39,7 +40,7 @@ PROVIDER_INFO: Dict[str, Dict] = {
     },
     "google": {
         "display": "Google / Gemini",
-        "description": "Gemini Flash, Pro",
+        "description": "Gemini 2.5 Flash, Pro, 3 Flash",
         "env_var": "GEMINI_API_KEY",
         "key_prefix": "AIza",
         "oauth": True,
@@ -47,7 +48,7 @@ PROVIDER_INFO: Dict[str, Dict] = {
     },
     "deepseek": {
         "display": "DeepSeek",
-        "description": "DeepSeek Chat, Reasoner",
+        "description": "DeepSeek V3, Reasoner",
         "env_var": "DEEPSEEK_API_KEY",
         "key_prefix": "sk-",
         "oauth": False,
@@ -65,39 +66,18 @@ PROVIDER_INFO: Dict[str, Dict] = {
 
 PROVIDER_ORDER = ["openai", "anthropic", "google", "deepseek", "ollama"]
 
-# Model → provider mapping (for filtering available models)
-_MODEL_PROVIDER_MAP: Dict[str, str] = {
-    "gemini-3-flash-preview": "google",
-    "gemini-2.5-pro": "google",
-    "gemini-2.5-flash": "google",
-    "gemini/gemini-3-flash-preview": "google",
-    "gemini/gemini-2.5-pro": "google",
-    "gpt-4o": "openai",
-    "gpt-4o-mini": "openai",
-    "o3": "openai",
-    "o3-mini": "openai",
-    "openai-codex/gpt-5.3-codex": "openai",
-    "claude-opus-4-20250514": "anthropic",
-    "claude-sonnet-4-20250514": "anthropic",
-    "claude-haiku-4-20250514": "anthropic",
-    "deepseek/deepseek-chat": "deepseek",
-    "deepseek/deepseek-reasoner": "deepseek",
-    "ollama/llama3.1:8b": "ollama",
-    "ollama/qwen3:32b": "ollama",
-}
-
 # Tier defaults — ordered preference per provider
 _TIER_DEFAULTS = {
     "simple": {
-        "google": "gemini-3-flash-preview",
-        "openai": "gpt-4o-mini",
+        "google": "gemini-2.5-flash",
+        "openai": "gpt-4.1-mini",
         "deepseek": "deepseek/deepseek-chat",
         "ollama": "ollama/llama3.1:8b",
-        "anthropic": "claude-haiku-4-20250514",
+        "anthropic": "claude-haiku-4-5-20251001",
     },
     "complex": {
-        "anthropic": "claude-sonnet-4-20250514",
-        "openai": "gpt-4o",
+        "anthropic": "claude-sonnet-4-5-20250929",
+        "openai": "gpt-4.1",
         "google": "gemini-2.5-pro",
         "deepseek": "deepseek/deepseek-reasoner",
         "ollama": "ollama/qwen3:32b",
@@ -105,7 +85,7 @@ _TIER_DEFAULTS = {
     "reasoning": {
         "openai": "o3",
         "deepseek": "deepseek/deepseek-reasoner",
-        "anthropic": "claude-sonnet-4-20250514",
+        "anthropic": "claude-sonnet-4-5-20250929",
         "google": "gemini-2.5-pro",
     },
     "free": {
@@ -158,18 +138,164 @@ def detect_existing_credentials() -> List[str]:
     return found
 
 
-def _format_cost(cost: float) -> str:
-    """Format a cost value for display."""
-    if cost == 0:
-        return "FREE"
-    return f"${cost:.2f}"
+# ---------------------------------------------------------------------------
+# API model fetching
+# ---------------------------------------------------------------------------
+
+def _fetch_openai_models(credential: str) -> List[str]:
+    """Fetch available chat models from the OpenAI API."""
+    req = urllib.request.Request(
+        "https://api.openai.com/v1/models",
+        headers={"Authorization": f"Bearer {credential}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        return []
+
+    models = []
+    for m in data.get("data", []):
+        mid = m.get("id", "")
+        # Only chat/completion models
+        if not any(mid.startswith(p) for p in ("gpt-", "o1", "o3", "o4", "chatgpt-")):
+            continue
+        # Exclude non-chat variants
+        if any(x in mid for x in ("-audio", "-realtime", "-search", "dall-e", "whisper", "tts", "embedding")):
+            continue
+        models.append(mid)
+    return sorted(models)
 
 
-def _format_context(ctx: int) -> str:
-    """Format context window for display."""
-    if ctx >= 1_000_000:
-        return f"{ctx // 1_000_000}M ctx"
-    return f"{ctx // 1_000}K ctx"
+def _fetch_anthropic_models(credential: str) -> List[str]:
+    """Fetch available models from the Anthropic API."""
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/models",
+        headers={
+            "x-api-key": credential,
+            "anthropic-version": "2023-06-01",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        return []
+
+    models = []
+    for m in data.get("data", []):
+        mid = m.get("id", "")
+        if mid.startswith("claude-"):
+            models.append(mid)
+    return sorted(models)
+
+
+def _fetch_google_models(credential: str) -> List[str]:
+    """Fetch available Gemini models from the Google GenAI API."""
+    url = f"https://generativelanguage.googleapis.com/v1beta/models?key={credential}"
+    req = urllib.request.Request(url)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        return []
+
+    models = []
+    for m in data.get("models", []):
+        name = m.get("name", "")  # e.g. "models/gemini-2.5-flash"
+        # Strip "models/" prefix
+        if name.startswith("models/"):
+            name = name[len("models/"):]
+        # Only gemini models that support generateContent
+        methods = m.get("supportedGenerationMethods", [])
+        if "generateContent" in methods and "gemini" in name:
+            models.append(name)
+    return sorted(models)
+
+
+def _fetch_deepseek_models(credential: str) -> List[str]:
+    """Fetch available models from the DeepSeek API."""
+    req = urllib.request.Request(
+        "https://api.deepseek.com/models",
+        headers={"Authorization": f"Bearer {credential}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        return []
+
+    models = []
+    for m in data.get("data", []):
+        mid = m.get("id", "")
+        if mid:
+            models.append(f"deepseek/{mid}")
+    return sorted(models)
+
+
+def _fetch_ollama_models() -> List[str]:
+    """Fetch locally installed models from Ollama."""
+    req = urllib.request.Request("http://localhost:11434/api/tags")
+    try:
+        with urllib.request.urlopen(req, timeout=3) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        return []
+
+    models = []
+    for m in data.get("models", []):
+        name = m.get("name", "")
+        if name:
+            models.append(f"ollama/{name}")
+    return sorted(models)
+
+
+def fetch_provider_models(provider: str, credential: str) -> List[str]:
+    """Fetch available model IDs from a provider's API.
+
+    Returns a list of model ID strings, or empty list on failure.
+    """
+    fetchers = {
+        "openai": _fetch_openai_models,
+        "anthropic": _fetch_anthropic_models,
+        "google": _fetch_google_models,
+        "deepseek": _fetch_deepseek_models,
+    }
+    if provider == "ollama":
+        return _fetch_ollama_models()
+    fetcher = fetchers.get(provider)
+    if fetcher and credential:
+        return fetcher(credential)
+    return []
+
+
+# ---------------------------------------------------------------------------
+# Tier classification
+# ---------------------------------------------------------------------------
+
+def classify_model_tier(model_id: str) -> str:
+    """Classify a model into a routing tier based on its name.
+
+    Returns one of: 'simple', 'complex', 'reasoning', 'free'.
+    """
+    lower = model_id.lower()
+
+    # Free — ollama / local models
+    if lower.startswith("ollama/") or lower.startswith("local/"):
+        return "free"
+
+    # Reasoning — o-series, reasoner
+    if any(lower.startswith(p) for p in ("o1-", "o1", "o3-", "o3", "o4-", "o4")):
+        return "reasoning"
+    if "reasoner" in lower:
+        return "reasoning"
+
+    # Simple — mini (but not gemini), nano, flash, haiku, lite, small
+    if any(x in lower for x in ("-mini", "nano", "flash", "haiku", "lite", "small")):
+        return "simple"
+
+    # Complex — everything else (pro, opus, sonnet, gpt-4.1, gpt-5, etc.)
+    return "complex"
 
 
 # ---------------------------------------------------------------------------
@@ -368,31 +494,50 @@ def _run_oauth_for_provider(provider: str) -> Optional[str]:
 # Step 4: Model selection
 # ---------------------------------------------------------------------------
 
-def get_available_models_for_providers(providers: List[str]) -> Dict[str, List[dict]]:
-    """Filter MODEL_REGISTRY by configured providers, grouped by tier.
+def get_available_models_for_providers(
+    providers: List[str],
+    fetched_models: Optional[Dict[str, List[str]]] = None,
+) -> Dict[str, List[dict]]:
+    """Build tier-grouped model lists from API-fetched models (with static fallback).
+
+    Args:
+        providers: List of provider keys the user selected.
+        fetched_models: Optional dict of {provider: [model_ids]} from API calls.
+            When provided, these are used as the primary source.
+            Falls back to MODEL_REGISTRY for providers with no fetched models.
 
     Returns dict with keys: simple, complex, reasoning, free.
-    Each value is a list of dicts: {model, cost_in, cost_out, context, provider}.
+    Each value is a list of dicts: {model, provider}.
     """
-    # Deduplicate models — skip gemini/ prefixed duplicates
-    skip_prefixed = set()
-    for model in MODEL_REGISTRY:
-        if model.startswith("gemini/"):
-            skip_prefixed.add(model)
+    all_models: List[dict] = []
+    providers_covered = set()
 
-    available = []
+    # Use API-fetched models when available
+    if fetched_models:
+        for provider, model_ids in fetched_models.items():
+            if model_ids:
+                providers_covered.add(provider)
+                for mid in model_ids:
+                    all_models.append({"model": mid, "provider": provider})
+
+    # Fall back to MODEL_REGISTRY for providers without fetched models
+    skip_prefixed = {m for m in MODEL_REGISTRY if m.startswith("gemini/")}
     for model, info in MODEL_REGISTRY.items():
         if model in skip_prefixed:
             continue
-        model_provider = _MODEL_PROVIDER_MAP.get(model)
-        if model_provider and model_provider in providers:
-            available.append({
-                "model": model,
-                "cost_in": info["cost_per_m_input"],
-                "cost_out": info["cost_per_m_output"],
-                "context": info["context_window"],
-                "provider": model_provider,
-            })
+        # Detect provider from model name
+        model_provider = _detect_model_provider(model)
+        if model_provider and model_provider in providers and model_provider not in providers_covered:
+            all_models.append({"model": model, "provider": model_provider})
+
+    # Deduplicate by model name
+    seen = set()
+    unique = []
+    for m in all_models:
+        if m["model"] not in seen:
+            seen.add(m["model"])
+            unique.append(m)
+    all_models = unique
 
     # Classify into tiers
     tiers: Dict[str, List[dict]] = {
@@ -402,28 +547,31 @@ def get_available_models_for_providers(providers: List[str]) -> Dict[str, List[d
         "free": [],
     }
 
-    for m in available:
-        # Free tier
-        if m["cost_in"] == 0 and m["cost_out"] == 0:
-            tiers["free"].append(m)
+    for m in all_models:
+        tier = classify_model_tier(m["model"])
+        tiers[tier].append(m)
 
-        # Simple tier: cheap models
-        if m["cost_in"] <= 0.20:
-            tiers["simple"].append(m)
-
-        # Complex tier: expensive models
-        if m["cost_in"] > 0.20:
-            tiers["complex"].append(m)
-
-        # Reasoning tier: specific models
-        if m["model"] in ("o3", "o3-mini", "deepseek/deepseek-reasoner"):
-            tiers["reasoning"].append(m)
-
-    # Sort each tier by cost
+    # Sort each tier alphabetically
     for tier in tiers.values():
-        tier.sort(key=lambda x: (x["cost_in"], x["model"]))
+        tier.sort(key=lambda x: x["model"])
 
     return tiers
+
+
+def _detect_model_provider(model: str) -> Optional[str]:
+    """Detect provider key from a model name (for static registry fallback)."""
+    lower = model.lower()
+    if lower.startswith("gemini") or lower.startswith("google/"):
+        return "google"
+    if lower.startswith("gpt-") or lower.startswith("o3") or lower.startswith("o4") or lower.startswith("o1") or lower.startswith("openai"):
+        return "openai"
+    if lower.startswith("claude-") or lower.startswith("anthropic/"):
+        return "anthropic"
+    if lower.startswith("deepseek/"):
+        return "deepseek"
+    if lower.startswith("ollama/"):
+        return "ollama"
+    return None
 
 
 def format_model_table(models: List[dict], tier: str) -> str:
@@ -437,28 +585,25 @@ def format_model_table(models: List[dict], tier: str) -> str:
     lines = [f"\n{tier_labels.get(tier, tier)}:"]
 
     for i, m in enumerate(models, 1):
-        cost_str = (
-            "FREE"
-            if m["cost_in"] == 0
-            else f"${m['cost_in']:.2f}/${m['cost_out']:.2f} per 1M"
-        )
-        ctx_str = _format_context(m["context"])
-        # Mark recommended (first model in sorted list)
-        rec = "  [RECOMMENDED]" if i == 1 else ""
-        lines.append(f"  {i}. {m['model']:36s} {cost_str:24s} {ctx_str}{rec}")
+        lines.append(f"  {i}. {m['model']}")
 
     return "\n".join(lines)
 
 
-def select_default_model(tier: str, providers: List[str]) -> Optional[str]:
-    """Pick the best default model for a tier based on configured providers."""
+def select_default_model(tier: str, providers: List[str], available: Optional[List[dict]] = None) -> Optional[str]:
+    """Pick the best default model for a tier based on configured providers.
+
+    If `available` is provided, only returns a default that appears in the list.
+    """
     tier_prefs = _TIER_DEFAULTS.get(tier, {})
+    available_names = {m["model"] for m in available} if available else None
+
     for provider in tier_prefs:
         if provider in providers:
             model = tier_prefs[provider]
-            # Verify model is in registry
-            if model in MODEL_REGISTRY:
-                return model
+            if available_names is not None and model not in available_names:
+                continue
+            return model
     return None
 
 
@@ -470,7 +615,7 @@ def prompt_model_selection(tier: str, models: List[dict], providers: List[str]) 
     table = format_model_table(models, tier)
     click.echo(table)
 
-    default_model = select_default_model(tier, providers)
+    default_model = select_default_model(tier, providers, available=models)
     default_idx = "1"
     for i, m in enumerate(models, 1):
         if m["model"] == default_model:
@@ -619,37 +764,56 @@ def run_setup_wizard(reconfigure: bool = False):
     click.echo()
 
     api_keys: Dict[str, str] = {}
+    collected_credentials: Dict[str, str] = {}
     for provider in providers:
         cred = prompt_credential_for_provider(provider, reconfigure=reconfigure)
-        # Collect API keys for .env (only plain keys, not OAuth tokens)
-        if cred and provider != "ollama":
-            info = PROVIDER_INFO[provider]
-            if info["env_var"]:
-                # Only write to .env if it looks like an API key (not an OAuth token)
-                if not cred.startswith("eyJ"):  # JWT tokens start with eyJ
-                    api_keys[info["env_var"]] = cred
+        if cred:
+            collected_credentials[provider] = cred
+            # Collect API keys for .env (only plain keys, not OAuth tokens)
+            if provider != "ollama":
+                info = PROVIDER_INFO[provider]
+                if info["env_var"]:
+                    # Only write to .env if it looks like an API key (not an OAuth token)
+                    if not cred.startswith("eyJ"):  # JWT tokens start with eyJ
+                        api_keys[info["env_var"]] = cred
+
+    # Step 3.5: Fetch available models from provider APIs
+    click.echo("-" * 56)
+    click.echo("  Fetching Available Models")
+    click.echo("-" * 56)
+    click.echo()
+
+    fetched_models: Dict[str, List[str]] = {}
+    for provider in providers:
+        cred = collected_credentials.get(provider)
+        display = PROVIDER_INFO[provider]["display"]
+        click.echo(f"  {display}...", nl=False)
+        models = fetch_provider_models(provider, cred or "")
+        if models:
+            fetched_models[provider] = models
+            click.echo(f" {len(models)} models found")
+        else:
+            click.echo(" using defaults")
+
+    click.echo()
 
     # Step 4: Model selection
     click.echo("-" * 56)
     click.echo("  Model Selection")
     click.echo("-" * 56)
 
-    tiers = get_available_models_for_providers(providers)
+    tiers = get_available_models_for_providers(providers, fetched_models=fetched_models or None)
 
     # Simple (required)
-    simple_model = None
-    if tiers["simple"]:
-        simple_model = prompt_model_selection("simple", tiers["simple"], providers)
+    simple_model = prompt_model_selection("simple", tiers["simple"], providers) if tiers["simple"] else None
     if not simple_model:
-        simple_model = select_default_model("simple", providers) or "gemini-3-flash-preview"
+        simple_model = select_default_model("simple", providers) or "gemini-2.5-flash"
         click.echo(f"  Using default simple model: {simple_model}\n")
 
     # Complex (required)
-    complex_model = None
-    if tiers["complex"]:
-        complex_model = prompt_model_selection("complex", tiers["complex"], providers)
+    complex_model = prompt_model_selection("complex", tiers["complex"], providers) if tiers["complex"] else None
     if not complex_model:
-        complex_model = select_default_model("complex", providers) or "gpt-4o"
+        complex_model = select_default_model("complex", providers) or "gpt-4.1"
         click.echo(f"  Using default complex model: {complex_model}\n")
 
     # Reasoning (optional)

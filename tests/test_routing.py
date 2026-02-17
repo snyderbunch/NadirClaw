@@ -70,20 +70,20 @@ class TestResolveProfile:
 
 class TestResolveAlias:
     def test_sonnet(self):
-        assert resolve_alias("sonnet") == "claude-sonnet-4-20250514"
+        assert resolve_alias("sonnet") == "claude-sonnet-4-5-20250929"
 
     def test_opus(self):
-        assert resolve_alias("opus") == "claude-opus-4-20250514"
+        assert resolve_alias("opus") == "claude-opus-4-6-20250918"
 
     def test_gpt4(self):
-        assert resolve_alias("gpt4") == "gpt-4o"
+        assert resolve_alias("gpt4") == "gpt-4.1"
 
     def test_flash(self):
-        assert resolve_alias("flash") == "gemini-3-flash-preview"
+        assert resolve_alias("flash") == "gemini-2.5-flash"
 
     def test_case_insensitive(self):
-        assert resolve_alias("SONNET") == "claude-sonnet-4-20250514"
-        assert resolve_alias("Flash") == "gemini-3-flash-preview"
+        assert resolve_alias("SONNET") == "claude-sonnet-4-5-20250929"
+        assert resolve_alias("Flash") == "gemini-2.5-flash"
 
     def test_unknown(self):
         assert resolve_alias("unknown-model") is None
