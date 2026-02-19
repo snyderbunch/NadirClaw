@@ -1,0 +1,640 @@
+diff --git a/nadirclaw/routing.py b/nadirclaw/routing.py
+index 529a62c..3653fa7 100644
+--- a/nadirclaw/routing.py
++++ b/nadirclaw/routing.py
+@@ -455,14 +455,17 @@ def apply_routing_modifiers(
+     )
+     routing_info["agentic"] = agentic
+ 
+-    if agentic["is_agentic"] and final_tier == "simple":
+-        final_model = complex_model
+-        final_tier = "complex"
+-        routing_info["modifiers_applied"].append("agentic_override")
+-        logger.info(
+-            "Agentic override: simple → complex (confidence=%.2f, signals=%s)",
+-            agentic["confidence"], agentic["signals"],
+-        )
++    # Agentic override DISABLED — OpenClaw always sends tool definitions,
++    # which triggers agentic detection on every request (score ~0.65+).
++    # The embedding classifier with conservative threshold (0.15) is sufficient.
++    # if agentic["is_agentic"] and final_tier == "simple":
++    #     final_model = complex_model
++    #     final_tier = "complex"
++    #     routing_info["modifiers_applied"].append("agentic_override")
++    #     logger.info(
++    #         "Agentic override: simple → complex (confidence=%.2f, signals=%s)",
++    #         agentic["confidence"], agentic["signals"],
++    #     )
+ 
+     # --- Reasoning detection ---
+     prompt_text = ""
+diff --git a/nadirclaw/server.py b/nadirclaw/server.py
+index 17421ca..837073f 100644
+--- a/nadirclaw/server.py
++++ b/nadirclaw/server.py
+@@ -9,6 +9,7 @@ import asyncio
+ import collections
+ import json
+ import logging
++import re
+ import time
+ import uuid
+ from concurrent.futures import ThreadPoolExecutor
+@@ -328,14 +329,102 @@ async def _smart_route_analysis(
+     return selected, analysis
+ 
+ 
++def _strip_openclaw_metadata(text: str) -> str:
++    """Strip OpenClaw's Telegram metadata wrapper from user messages.
++
++    OpenClaw wraps Telegram messages like:
++        Conversation info (untrusted metadata):
++        ```json
++        {"message_id": "7626", "sender": "8598068238"}
++        ```
++
++        Hi Sophia.
++
++    We need to classify only the actual user text ("Hi Sophia."),
++    not the JSON metadata which makes everything look complex.
++    """
++    import re
++    # Match the OpenClaw metadata block and strip it
++    pattern = r'^Conversation info \(untrusted metadata\):\s*```json\s*\{[^}]*\}\s*```\s*'
++    stripped = re.sub(pattern, '', text, flags=re.DOTALL).strip()
++    return stripped if stripped else text
++
++
++_MODEL_OVERRIDES = {
++    "use sonnet":  ("anthropic/claude-sonnet-4-6", "complex", "💎 sonnet"),
++    "use opus":    ("anthropic/claude-opus-4-6",   "complex", "🔮 opus"),
++    "use haiku":   ("anthropic/claude-haiku-4-5",  "simple",  "🍃 haiku"),
++    "use gemini":  ("gemini/gemini-3-flash-preview", "simple", "⚡ gemini"),
++}
++
++
++def _check_model_override(text: str):
++    """Check if the user message contains a natural language model override.
++    Returns (model, tier, badge_hint) or None."""
++    lower = text.lower()
++    for phrase, result in _MODEL_OVERRIDES.items():
++        if phrase in lower:
++            return result
++    return None
++
++
+ async def _smart_route_full(
+     messages: List[ChatMessage], user: UserSession
+ ) -> tuple:
+-    """Smart route for full completions."""
+-    user_msgs = [m.text_content() for m in messages if m.role == "user"]
+-    prompt = user_msgs[-1] if user_msgs else ""
++    """Smart route with optional high-water-mark (HWM).
++    Per-message classification by default. When HWM is enabled, checks if any of
++    the last 3 user messages was complex and keeps Sonnet sticky."""
++    user_msgs = [_strip_openclaw_metadata(m.text_content()) for m in messages if m.role == "user"]
+     system_msg = next((m.text_content() for m in messages if m.role in ("system", "developer")), "")
+-    return await _smart_route_analysis(prompt, system_msg, user)
++
++    if not user_msgs:
++        return await _smart_route_analysis("", system_msg, user)
++
++    # Check for natural language model override ("use sonnet", "use gemini", etc.)
++    last_prompt = user_msgs[-1]
++    override = _check_model_override(last_prompt)
++    if override:
++        model, tier, _ = override
++        logger.info("Model override detected: '%s' → %s", last_prompt[:60], model)
++        return model, {
++            "strategy": "user-override",
++            "selected_model": model,
++            "tier": tier,
++            "confidence": 1.0,
++            "complexity_score": 0,
++            "override_phrase": next(
++                p for p in _MODEL_OVERRIDES if p in last_prompt.lower()
++            ),
++        }
++
++    # Classify the last message (this is the primary result we return)
++    selected, analysis = await _smart_route_analysis(last_prompt, system_msg, user)
++
++    # If already complex, no need to check history
++    if analysis.get("tier") == "complex":
++        return selected, analysis
++
++    # High-water-mark: if enabled, check prior messages for complexity.
++    # Disabled by default — in long conversations (Telegram), there's always
++    # a complex message nearby, so simple messages never route to Gemini.
++    if settings.HWM_ENABLED:
++        recent = user_msgs[-3:-1]  # 2nd-to-last and 3rd-to-last
++        for prior_msg in recent:
++            _, prior_analysis = await _smart_route_analysis(prior_msg, system_msg, user)
++            if prior_analysis.get("tier") == "complex":
++                selected = settings.COMPLEX_MODEL
++                analysis["tier"] = "complex"
++                analysis["selected_model"] = selected
++                analysis["reasoning"] = (
++                    f"High-water-mark override: current message is simple but "
++                    f"recent message was complex"
++                )
++                logger.info(
++                    "High-water-mark: simple → complex (prior msg was complex)"
++                )
++                return selected, analysis
++
++    return selected, analysis
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -458,13 +547,48 @@ async def _call_gemini(
+     for m in request.messages:
+         if m.role in ("system", "developer"):
+             system_parts.append(m.text_content())
+-        else:
++        elif m.role == "tool":
++            # Tool result from history — convert to plain text (Gemini requires
++            # thought_signature on function_response parts from prior turns)
++            extra = getattr(m, "model_extra", {}) or {}
++            tool_name = extra.get("name", "unknown")
++            result_text = m.text_content()
++            # Truncate very long tool results to keep context manageable
++            if len(result_text) > 2000:
++                result_text = result_text[:2000] + "\n... [truncated]"
+             contents.append(
+                 types.Content(
+-                    role="user" if m.role == "user" else "model",
+-                    parts=[types.Part.from_text(text=m.text_content())],
++                    role="user",
++                    parts=[types.Part.from_text(
++                        text=f"[Tool result for {tool_name}]: {result_text}",
++                    )],
+                 )
+             )
++        else:
++            msg_extra = getattr(m, "model_extra", {}) or {}
++            msg_tool_calls = msg_extra.get("tool_calls")
++            if m.role == "assistant" and msg_tool_calls:
++                # Assistant message with tool_calls from history — convert to
++                # plain text (Gemini requires thought_signature on function_call
++                # parts that weren't generated by this model)
++                parts_text = []
++                text = m.text_content()
++                if text:
++                    parts_text.append(text)
++                for tc in msg_tool_calls:
++                    func = tc.get("function", {})
++                    parts_text.append(f"[Called tool {func.get('name', '?')}({func.get('arguments', '{}')})]")
++                contents.append(types.Content(
++                    role="model",
++                    parts=[types.Part.from_text(text="\n".join(parts_text) or "(tool call)")],
++                ))
++            else:
++                contents.append(
++                    types.Content(
++                        role="user" if m.role == "user" else "model",
++                        parts=[types.Part.from_text(text=m.text_content())],
++                    )
++                )
+ 
+     # Build generation config
+     gen_config_kwargs: Dict[str, Any] = {}
+@@ -475,23 +599,54 @@ async def _call_gemini(
+     if request.top_p is not None:
+         gen_config_kwargs["top_p"] = request.top_p
+ 
+-    # NOTE: Function call parts are filtered out programmatically when
+-    # extracting the response (see "handle function_call parts" below),
+-    # so no prompt-level instruction is needed here.
++    # Convert OpenAI tool definitions to Gemini FunctionDeclaration format
++    # Gemini's SDK only accepts a subset of JSON Schema — strip unsupported keys
++    def _sanitize_params(schema):
++        """Recursively strip JSON Schema keys unsupported by Gemini."""
++        if not isinstance(schema, dict):
++            return schema
++        ALLOWED = {"type", "description", "properties", "required", "enum",
++                    "items", "nullable", "format", "minimum", "maximum"}
++        cleaned = {k: v for k, v in schema.items() if k in ALLOWED}
++        if "properties" in cleaned and isinstance(cleaned["properties"], dict):
++            cleaned["properties"] = {
++                k: _sanitize_params(v) for k, v in cleaned["properties"].items()
++            }
++        if "items" in cleaned and isinstance(cleaned["items"], dict):
++            cleaned["items"] = _sanitize_params(cleaned["items"])
++        return cleaned
++
++    extra = request.model_extra or {}
++    openai_tools = extra.get("tools") or []
++    gemini_tools = None
++    if openai_tools:
++        func_decls = []
++        for tool in openai_tools:
++            if tool.get("type") == "function":
++                func = tool["function"]
++                params = func.get("parameters")
++                if params:
++                    params = _sanitize_params(params)
++                func_decls.append(types.FunctionDeclaration(
++                    name=func["name"],
++                    description=func.get("description", ""),
++                    parameters=params,
++                ))
++        if func_decls:
++            gemini_tools = [types.Tool(function_declarations=func_decls)]
+ 
+     generate_kwargs: Dict[str, Any] = {
+         "model": native_model,
+         "contents": contents,
+     }
+-    if gen_config_kwargs:
+-        generate_kwargs["config"] = types.GenerateContentConfig(
+-            **gen_config_kwargs,
+-            system_instruction="\n".join(system_parts) if system_parts else None,
+-        )
+-    elif system_parts:
+-        generate_kwargs["config"] = types.GenerateContentConfig(
+-            system_instruction="\n".join(system_parts),
+-        )
++
++    config_kwargs = {**gen_config_kwargs}
++    if system_parts:
++        config_kwargs["system_instruction"] = "\n".join(system_parts)
++    if gemini_tools:
++        config_kwargs["tools"] = gemini_tools
++    if config_kwargs:
++        generate_kwargs["config"] = types.GenerateContentConfig(**config_kwargs)
+ 
+     logger.debug("Calling Gemini: model=%s (attempt %d/%d)", native_model, _retry_count + 1, MAX_RETRIES + 1)
+ 
+@@ -562,14 +717,25 @@ async def _call_gemini(
+                 finish_reason = "length"
+             logger.debug("Gemini finish_reason: %s", reason_str)
+ 
+-        # Extract text from parts (handle function_call parts gracefully)
++        # Extract text and function_call parts
++        tool_calls = []
+         if hasattr(candidate, "content") and candidate.content and candidate.content.parts:
+             text_parts = []
+             for part in candidate.content.parts:
+                 if hasattr(part, "text") and part.text:
+                     text_parts.append(part.text)
+                 elif hasattr(part, "function_call") and part.function_call:
+-                    logger.info("Gemini returned function_call: %s (ignoring — NadirClaw doesn't execute tools)", part.function_call.name)
++                    import json as _json
++                    logger.info("Gemini returned function_call: %s", part.function_call.name)
++                    args = dict(part.function_call.args) if part.function_call.args else {}
++                    tool_calls.append({
++                        "id": f"call_{uuid.uuid4().hex[:24]}",
++                        "type": "function",
++                        "function": {
++                            "name": part.function_call.name,
++                            "arguments": _json.dumps(args),
++                        },
++                    })
+             content = "".join(text_parts)
+     else:
+         # No candidates — check for prompt feedback (safety block)
+@@ -577,7 +743,7 @@ async def _call_gemini(
+         if feedback:
+             logger.warning("Gemini blocked request: %s", feedback)
+ 
+-    if not content:
++    if not content and not tool_calls:
+         # Try response.text as a fallback
+         try:
+             content = response.text or ""
+@@ -589,12 +755,16 @@ async def _call_gemini(
+                 native_model, finish_reason, len(response.candidates) if response.candidates else 0,
+             )
+ 
+-    return {
++    result: Dict[str, Any] = {
+         "content": content,
+         "finish_reason": finish_reason,
+         "prompt_tokens": prompt_tokens,
+         "completion_tokens": completion_tokens,
+     }
++    if tool_calls:
++        result["tool_calls"] = tool_calls
++        result["finish_reason"] = "tool_calls"
++    return result
+ 
+ 
+ async def _call_litellm(
+@@ -615,7 +785,24 @@ async def _call_litellm(
+         litellm_model = model
+         cred_provider = provider
+ 
+-    messages = [{"role": m.role, "content": m.text_content()} for m in request.messages]
++    # Build messages preserving tool_call fields needed by Anthropic/OpenAI
++    messages = []
++    for m in request.messages:
++        msg = {"role": m.role, "content": m.text_content()}
++        msg_extra = getattr(m, "model_extra", {}) or {}
++        if m.role == "tool":
++            # Tool result messages need tool_call_id and name
++            if msg_extra.get("tool_call_id"):
++                msg["tool_call_id"] = msg_extra["tool_call_id"]
++            if msg_extra.get("name"):
++                msg["name"] = msg_extra["name"]
++        elif m.role == "assistant" and msg_extra.get("tool_calls"):
++            # Assistant messages with tool_calls must include them
++            msg["tool_calls"] = msg_extra["tool_calls"]
++            # Anthropic requires content to be null, not empty string, when tool_calls present
++            if not msg["content"]:
++                msg["content"] = None
++        messages.append(msg)
+     call_kwargs: Dict[str, Any] = {"model": litellm_model, "messages": messages}
+     if request.temperature is not None:
+         call_kwargs["temperature"] = request.temperature
+@@ -624,6 +811,13 @@ async def _call_litellm(
+     if request.top_p is not None:
+         call_kwargs["top_p"] = request.top_p
+ 
++    # Forward tool definitions so the model can make tool calls
++    extra = request.model_extra or {}
++    if extra.get("tools"):
++        call_kwargs["tools"] = extra["tools"]
++    if extra.get("tool_choice"):
++        call_kwargs["tool_choice"] = extra["tool_choice"]
++
+     if cred_provider and cred_provider != "ollama":
+         api_key = get_credential(cred_provider)
+         if api_key:
+@@ -640,13 +834,31 @@ async def _call_litellm(
+             raise RateLimitExhausted(model=model, retry_after=60)
+         raise
+ 
+-    return {
+-        "content": response.choices[0].message.content,
++    message = response.choices[0].message
++    result: Dict[str, Any] = {
++        "content": message.content or "",
+         "finish_reason": response.choices[0].finish_reason or "stop",
+         "prompt_tokens": response.usage.prompt_tokens if response.usage else 0,
+         "completion_tokens": response.usage.completion_tokens if response.usage else 0,
+     }
+ 
++    # Forward tool_calls if the model requested them
++    if hasattr(message, "tool_calls") and message.tool_calls:
++        result["tool_calls"] = [
++            {
++                "id": tc.id,
++                "type": "function",
++                "function": {
++                    "name": tc.function.name,
++                    "arguments": tc.function.arguments,
++                },
++            }
++            for tc in message.tool_calls
++        ]
++        result["finish_reason"] = "tool_calls"
++
++    return result
++
+ 
+ # ---------------------------------------------------------------------------
+ # Model dispatch + fallback on rate limit
+@@ -861,42 +1073,27 @@ async def chat_completions(
+                 }
+         else:
+             # --- Smart routing (auto or no model specified) ---
+-            # Check session cache first
+-            session_cache = get_session_cache()
+-            cached = session_cache.get(request.messages)
+-            if cached:
+-                cached_model, cached_tier = cached
+-                selected_model = cached_model
+-                analysis_info = {
+-                    "strategy": "session-cache",
+-                    "selected_model": selected_model,
+-                    "tier": cached_tier,
+-                    "confidence": 1.0,
+-                    "complexity_score": 0,
+-                }
+-                logger.debug("Session cache hit: model=%s tier=%s", cached_model, cached_tier)
+-            else:
+-                selected_model, analysis_info = await _smart_route_full(
+-                    request.messages, current_user
+-                )
+-
+-                # Apply routing modifiers (agentic, reasoning, context window)
+-                selected_model, final_tier, routing_info = apply_routing_modifiers(
+-                    base_model=selected_model,
+-                    base_tier=analysis_info.get("tier", "simple"),
+-                    request_meta=req_meta,
+-                    messages=request.messages,
+-                    simple_model=settings.SIMPLE_MODEL,
+-                    complex_model=settings.COMPLEX_MODEL,
+-                    reasoning_model=settings.REASONING_MODEL,
+-                    free_model=settings.FREE_MODEL,
+-                )
+-                analysis_info["tier"] = final_tier
+-                analysis_info["selected_model"] = selected_model
+-                analysis_info["routing_modifiers"] = routing_info
++            # Session cache DISABLED — OpenClaw sends full conversation history
++            # with every request, so per-message classification is safe. Session
++            # pinning caused "hi" greetings to lock entire conversations to Gemini.
++            selected_model, analysis_info = await _smart_route_full(
++                request.messages, current_user
++            )
+ 
+-                # Cache this decision for session persistence
+-                session_cache.put(request.messages, selected_model, final_tier)
++            # Apply routing modifiers (agentic, reasoning, context window)
++            selected_model, final_tier, routing_info = apply_routing_modifiers(
++                base_model=selected_model,
++                base_tier=analysis_info.get("tier", "simple"),
++                request_meta=req_meta,
++                messages=request.messages,
++                simple_model=settings.SIMPLE_MODEL,
++                complex_model=settings.COMPLEX_MODEL,
++                reasoning_model=settings.REASONING_MODEL,
++                free_model=settings.FREE_MODEL,
++            )
++            analysis_info["tier"] = final_tier
++            analysis_info["selected_model"] = selected_model
++            analysis_info["routing_modifiers"] = routing_info
+ 
+         # Resolve provider credential
+         from nadirclaw.credentials import detect_provider, get_credential
+@@ -954,6 +1151,20 @@ async def chat_completions(
+ 
+         _log_request(log_entry)
+ 
++        # ------------------------------------------------------------------
++        # Append model badge to text-only responses (skip tool calls)
++        # ------------------------------------------------------------------
++        content = response_data.get("content") or ""
++        if content and not response_data.get("tool_calls"):
++            # Strip any badges the model echoed from conversation history
++            content = re.sub(
++                r'(\n\n(?:⚡|💎|🔮|🍃|🔹)\s+\w+(?:\s+↩\s+\w+)?)+\s*$',
++                '',
++                content,
++            )
++            badge = _model_badge(selected_model, analysis_info)
++            response_data["content"] = f"{content}\n\n{badge}"
++
+         # ------------------------------------------------------------------
+         # Streaming response (SSE) — for OpenClaw / streaming clients
+         # ------------------------------------------------------------------
+@@ -965,6 +1176,13 @@ async def chat_completions(
+         # ------------------------------------------------------------------
+         # Non-streaming response (regular JSON)
+         # ------------------------------------------------------------------
++        message_obj = {
++            "role": "assistant",
++            "content": response_data["content"],
++        }
++        if response_data.get("tool_calls"):
++            message_obj["tool_calls"] = response_data["tool_calls"]
++
+         return {
+             "id": request_id,
+             "object": "chat.completion",
+@@ -973,10 +1191,7 @@ async def chat_completions(
+             "choices": [
+                 {
+                     "index": 0,
+-                    "message": {
+-                        "role": "assistant",
+-                        "content": response_data["content"],
+-                    },
++                    "message": message_obj,
+                     "finish_reason": response_data["finish_reason"],
+                 }
+             ],
+@@ -1010,6 +1225,34 @@ async def chat_completions(
+         )
+ 
+ 
++def _model_badge(model: str, analysis_info: dict) -> str:
++    """Return a small emoji + model name tag for response attribution."""
++    m = model.lower()
++    if "sonnet" in m:
++        badge = "💎 sonnet"
++    elif "opus" in m:
++        badge = "🔮 opus"
++    elif "haiku" in m:
++        badge = "🍃 haiku"
++    elif "gemini" in m:
++        badge = "⚡ gemini"
++    else:
++        short = model.split("/")[-1].split("-")[0]
++        badge = f"🔹 {short}"
++
++    fallback_from = analysis_info.get("fallback_from")
++    if fallback_from:
++        fb = fallback_from.lower()
++        if "sonnet" in fb:
++            badge += " ↩ sonnet"
++        elif "gemini" in fb:
++            badge += " ↩ gemini"
++        else:
++            badge += f" ↩ {fallback_from.split('/')[-1].split('-')[0]}"
++
++    return badge
++
++
+ def _build_streaming_response(
+     request_id: str,
+     model: str,
+@@ -1027,24 +1270,58 @@ def _build_streaming_response(
+     async def event_generator():
+         created = int(time.time())
+         content = response_data.get("content", "") or ""
++        tool_calls = response_data.get("tool_calls")
+ 
+-        # Chunk 1: the content
+-        chunk = {
+-            "id": request_id,
+-            "object": "chat.completion.chunk",
+-            "created": created,
+-            "model": model,
+-            "choices": [
++        if tool_calls:
++            # Chunk 1: role + tool_calls (OpenAI streaming format)
++            delta = {"role": "assistant", "content": content or None}
++            delta["tool_calls"] = [
+                 {
+-                    "index": 0,
+-                    "delta": {"role": "assistant", "content": content},
+-                    "finish_reason": None,
++                    "index": i,
++                    "id": tc["id"],
++                    "type": "function",
++                    "function": {
++                        "name": tc["function"]["name"],
++                        "arguments": tc["function"]["arguments"],
++                    },
+                 }
+-            ],
+-        }
+-        yield {"data": json.dumps(chunk)}
++                for i, tc in enumerate(tool_calls)
++            ]
++            chunk = {
++                "id": request_id,
++                "object": "chat.completion.chunk",
++                "created": created,
++                "model": model,
++                "choices": [
++                    {
++                        "index": 0,
++                        "delta": delta,
++                        "finish_reason": None,
++                    }
++                ],
++            }
++            yield {"data": json.dumps(chunk)}
++        else:
++            # Chunk 1: the content
++            chunk = {
++                "id": request_id,
++                "object": "chat.completion.chunk",
++                "created": created,
++                "model": model,
++                "choices": [
++                    {
++                        "index": 0,
++                        "delta": {"role": "assistant", "content": content},
++                        "finish_reason": None,
++                    }
++                ],
++            }
++            yield {"data": json.dumps(chunk)}
+ 
+         # Chunk 2: finish reason + usage
++        finish_reason = response_data.get("finish_reason", "stop")
++        if tool_calls:
++            finish_reason = "tool_calls"
+         finish_chunk = {
+             "id": request_id,
+             "object": "chat.completion.chunk",
+@@ -1054,7 +1331,7 @@ def _build_streaming_response(
+                 {
+                     "index": 0,
+                     "delta": {},
+-                    "finish_reason": response_data.get("finish_reason", "stop"),
++                    "finish_reason": finish_reason,
+                 }
+             ],
+             "usage": {
+diff --git a/nadirclaw/settings.py b/nadirclaw/settings.py
+index b4cc438..79d4564 100644
+--- a/nadirclaw/settings.py
++++ b/nadirclaw/settings.py
+@@ -95,6 +95,12 @@ class Settings:
+         """Free fallback model. Falls back to SIMPLE_MODEL."""
+         return os.getenv("NADIRCLAW_FREE_MODEL", "") or self.SIMPLE_MODEL
+ 
++    @property
++    def HWM_ENABLED(self) -> bool:
++        """High-water-mark: if any of last 3 user messages was complex, keep on Sonnet.
++        Disabled by default — per-message classification is better for long conversations."""
++        return os.getenv("NADIRCLAW_HWM_ENABLED", "").lower() in ("1", "true", "yes")
++
+     @property
+     def has_explicit_tiers(self) -> bool:
+         """True if SIMPLE_MODEL and COMPLEX_MODEL are explicitly set via env."""
